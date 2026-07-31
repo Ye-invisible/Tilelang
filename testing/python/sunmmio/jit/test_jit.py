@@ -1171,9 +1171,12 @@ def test_sunmmio_softmax_output_dma_wait_is_hoisted_before_tile_store_loop():
         for idx, line in enumerate(lines[input_dma_idx:store_idx], start=input_dma_idx)
         if "for i in T.serial" in line and "tile.domain" in line
     )
+    output_wait_idx = max(idx for idx, line in enumerate(lines[:output_dma_idx]) if wait_marker in line)
     # Allow the output-DMA pipeline's prologue null-init (before the by-loop); forbid resets inside the loop body.
     assert all(null_marker not in line for line in lines[input_dma_idx:output_dma_idx])
-    assert any(wait_marker in line for line in lines[input_dma_idx:tile_store_loop_idx])
+    # ODMA waits are engine-wide.  Resolve the previous output DMA before
+    # launching the next input DMA on the same engine.
+    assert output_wait_idx < input_dma_idx < tile_store_loop_idx
     assert all(wait_marker not in line for line in lines[tile_store_loop_idx:output_dma_idx])
 
 
