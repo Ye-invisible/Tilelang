@@ -14,11 +14,13 @@
  */
 
 #include "../op/builtin.h"
+#include "../op/comm.h"
 #include "../op/utils.h"
 #include "../target/sunmmio/cost_model.h"
 #include "../target/sunmmio/hardware_types.h"
 #include "../target/sunmmio_utils.h"
 #include "sunmmio_pipeline_planning/pipeline_diagnostic.h"
+#include "sunmmio_pipeline_planning/resource_types_for_ilp.h"
 #include "sunmmio_pipeline_planning/stmt_read_write_collector.h"
 
 #include <algorithm>
@@ -113,6 +115,7 @@ public:
   std::string name{""};
   Stmt stmt;
   DeviceType device_type{DeviceType::Unspecified};
+  int execution_resource{-1};
 
   // True if this instruction should be placed in the prefetch queue (Shift=1)
   bool is_prefetch{false};
@@ -146,6 +149,75 @@ public:
     return name == other.name;
   }
 };
+
+struct GreedyAccessInfo {
+  BufferRegion region;
+  bool is_write{false};
+
+  Buffer buffer() const { return region->buffer; }
+};
+
+static int GetGreedyExecutionResource(const PipelineInstruction &instruction) {
+  std::vector<GreedyAccessInfo> accesses;
+  accesses.reserve(instruction.reads.size() + instruction.writes.size());
+  for (const BufferRegion &read : instruction.reads) {
+    accesses.push_back({read, false});
+  }
+  for (const BufferRegion &write : instruction.writes) {
+    accesses.push_back({write, true});
+  }
+  std::vector<int> resources =
+      BuildIlpResources(instruction.stmt, instruction.device_type, accesses);
+  for (int resource : resources) {
+    if (resource == static_cast<int>(IlpResourceType::kTensorCore) ||
+        resource == static_cast<int>(IlpResourceType::kVectorCore) ||
+        resource == static_cast<int>(IlpResourceType::kODMA0) ||
+        resource == static_cast<int>(IlpResourceType::kODMA1)) {
+      return resource;
+    }
+  }
+  LOG(FATAL) << "No execution resource for greedy pipeline instruction "
+             << instruction.name;
+  return -1;
+}
+
+static int GetGreedyIssuePriority(const PipelineInstruction &instruction) {
+  int resource = instruction.execution_resource;
+  if (resource == static_cast<int>(IlpResourceType::kODMA1)) {
+    return 0;
+  }
+  if (resource == static_cast<int>(IlpResourceType::kODMA0)) {
+    return 1;
+  }
+  // DMA launch is asynchronous, while tensor commands block the scalar issue
+  // stream.  Launch same-time asynchronous work before blocking computation.
+  if (resource == static_cast<int>(IlpResourceType::kTensorCore)) {
+    return 2;
+  }
+  if (resource == static_cast<int>(IlpResourceType::kVectorCore)) {
+    return 3;
+  }
+  return 4;
+}
+
+static bool IsAllGatherInstruction(const PipelineInstruction &instruction) {
+  const CallNode *broadcast = nullptr;
+  PostOrderVisit(instruction.stmt, [&](const ObjectRef &obj) {
+    const auto *call = obj.as<CallNode>();
+    if (call && call->op.same_as(Op::Get("tl.broadcast_"))) {
+      ICHECK(broadcast == nullptr)
+          << "A pipeline statement may contain at most one broadcast leaf";
+      broadcast = call;
+    }
+  });
+  if (broadcast == nullptr) {
+    return false;
+  }
+  ICHECK(broadcast->args.size() == static_cast<size_t>(kBroadcastArgCount) ||
+         broadcast->args.size() == static_cast<size_t>(kBroadcastArgCount + 1))
+      << "tl.broadcast_ expects its fixed arguments and optional src_core";
+  return broadcast->args.size() == static_cast<size_t>(kBroadcastArgCount);
+}
 
 enum class PhysicalSramBank : int {
   ASRAMPing = 0,
@@ -229,6 +301,12 @@ struct LocalDependencyEdge {
   int distance{0};
 };
 
+struct TemplateOrderEdge {
+  int source_instruction_id{-1};
+  int target_instruction_id{-1};
+  int distance{0};
+};
+
 enum class SemanticDependencyKind { kRAW, kWAR, kWAW };
 
 struct SemanticDependencyEdge {
@@ -274,6 +352,7 @@ struct BufferAccessInfo {
  */
 struct LocalDDG {
   std::vector<LocalDependencyEdge> edges;
+  std::vector<TemplateOrderEdge> ordering_edges;
   std::vector<SemanticDependencyEdge> semantic_edges;
   std::vector<std::vector<int>> forward_predecessors;
   std::vector<std::vector<int>> forward_successors;
@@ -292,22 +371,39 @@ static std::vector<GreedyBankColoring> BuildGreedyBankColorings(
     const LocalDDG &local_ddg,
     const std::unordered_set<const BufferNode *> &versioned_buffers, int faster,
     size_t *total_candidate_count) {
-  std::vector<std::pair<const BufferNode *, int>> writers;
-  std::map<std::pair<const BufferNode *, int>, int> writer_index;
+  using WriterKey = std::pair<const BufferNode *, int>;
+  std::map<const BufferNode *, std::set<int>> writers_by_buffer;
   for (const LocalDependencyEdge &edge : local_ddg.edges) {
     if (!versioned_buffers.count(edge.buffer) ||
         !IsRuntimeBankedBuffer(edge.buffer)) {
       continue;
     }
-    std::pair<const BufferNode *, int> key{edge.buffer,
-                                           edge.producer_instruction_id};
-    if (!writer_index.count(key)) {
-      writer_index[key] = static_cast<int>(writers.size());
-      writers.push_back(key);
-    }
+    writers_by_buffer[edge.buffer].insert(edge.producer_instruction_id);
   }
 
-  int search_bits = static_cast<int>(writers.size());
+  // Precolors are relative bank phases.  Writers 0,2,... of one buffer must
+  // stay together, writers 1,3,... must stay together, and the two classes
+  // must use opposite banks.  Search one global inversion bit per buffer
+  // instead of independently recoloring every writer.
+  struct WriterColor {
+    int variable{-1};
+    int precolor{0};
+  };
+  std::map<WriterKey, WriterColor> writer_colors;
+  int search_bits = 0;
+  for (const BufferNode *buffer : local_ddg.buffer_order) {
+    auto writers_it = writers_by_buffer.find(buffer);
+    if (writers_it == writers_by_buffer.end()) {
+      continue;
+    }
+    int precolor = 0;
+    for (int writer_id : writers_it->second) {
+      writer_colors[{buffer, writer_id}] = {search_bits, precolor};
+      precolor ^= 1;
+    }
+    ++search_bits;
+  }
+
   ICHECK(faster == -1 || faster > 0)
       << "tl.sunmmio_faster must be -1 or a positive coloring budget";
   ICHECK_LT(search_bits, static_cast<int>(sizeof(size_t) * 8))
@@ -321,22 +417,24 @@ static std::vector<GreedyBankColoring> BuildGreedyBankColorings(
   result.reserve(candidate_count);
   for (size_t mask = 0; mask < candidate_count; ++mask) {
     GreedyBankColoring coloring;
-    coloring.bits.resize(writers.size(), 0);
-    for (size_t i = 0; i < writers.size(); ++i) {
+    coloring.bits.resize(search_bits, 0);
+    for (int i = 0; i < search_bits; ++i) {
       coloring.bits[i] = static_cast<int>((mask >> i) & 1);
     }
-    for (size_t i = 0; i < writers.size(); ++i) {
-      coloring.writer_phases[writers[i].first][writers[i].second] =
-          coloring.bits[i];
+    for (const auto &[writer, color] : writer_colors) {
+      coloring.writer_phases[writer.first][writer.second] =
+          coloring.bits[color.variable] ^ color.precolor;
     }
 
     bool valid = true;
     for (const LocalDependencyEdge &edge : local_ddg.edges) {
       auto it_writer =
-          writer_index.find({edge.buffer, edge.producer_instruction_id});
-      if (it_writer == writer_index.end())
+          writer_colors.find({edge.buffer, edge.producer_instruction_id});
+      if (it_writer == writer_colors.end())
         continue;
-      int reader_phase = coloring.bits[it_writer->second] ^ (edge.distance & 1);
+      const WriterColor &color = it_writer->second;
+      int writer_phase = coloring.bits[color.variable] ^ color.precolor;
+      int reader_phase = writer_phase ^ (edge.distance & 1);
       auto &reader_map = coloring.reader_phases[edge.buffer];
       auto [it_reader, inserted] =
           reader_map.emplace(edge.consumer_instruction_id, reader_phase);
@@ -529,6 +627,28 @@ public:
       }
     }
 
+    // All cores must encounter all-gather barriers in one common epoch order.
+    // Data hazards alone cannot enforce this when collectives use different
+    // buffers or ODMA directions, so preserve template order explicitly and
+    // close the chain across consecutive logical iterations.
+    std::vector<int> all_gather_ids;
+    for (const PipelineInstruction &instruction :
+         single_iteration_instructions) {
+      if (IsAllGatherInstruction(instruction)) {
+        all_gather_ids.push_back(instruction.id);
+      }
+    }
+    for (size_t i = 1; i < all_gather_ids.size(); ++i) {
+      int source = all_gather_ids[i - 1];
+      int target = all_gather_ids[i];
+      ddg.ordering_edges.push_back({source, target, 0});
+    }
+    if (all_gather_ids.size() > 1) {
+      int source = all_gather_ids.back();
+      int target = all_gather_ids.front();
+      ddg.ordering_edges.push_back({source, target, 1});
+    }
+
     return ddg;
   }
 };
@@ -554,6 +674,14 @@ ValidateLocalDDG(const std::vector<PipelineInstruction> &instructions,
         edge.target_instruction_id < 0 ||
         edge.target_instruction_id >= instruction_count ||
         edge.buffer == nullptr || edge.distance < 0) {
+      return false;
+    }
+  }
+  for (const TemplateOrderEdge &edge : ddg.ordering_edges) {
+    if (edge.source_instruction_id < 0 ||
+        edge.source_instruction_id >= instruction_count ||
+        edge.target_instruction_id < 0 ||
+        edge.target_instruction_id >= instruction_count || edge.distance < 0) {
       return false;
     }
   }
@@ -592,7 +720,9 @@ static void MaybeWriteGreedyGraphJson(
     const PipelineInstruction &instruction = instructions[i];
     out << "    {\"id\": " << instruction.id
         << ", \"iteration_offset\": 0, \"hardware\": "
-        << static_cast<int>(instruction.device_type) << ", \"reads\": [";
+        << static_cast<int>(instruction.device_type)
+        << ", \"resource\": " << instruction.execution_resource
+        << ", \"reads\": [";
     for (size_t j = 0; j < instruction.reads.size(); ++j) {
       if (j != 0)
         out << ", ";
@@ -607,13 +737,21 @@ static void MaybeWriteGreedyGraphJson(
     out << "]}" << (i + 1 == instructions.size() ? "\n" : ",\n");
   }
   out << "  ],\n  \"edges\": [\n";
-  for (size_t i = 0; i < ddg.semantic_edges.size(); ++i) {
-    const SemanticDependencyEdge &edge = ddg.semantic_edges[i];
+  size_t edge_index = 0;
+  size_t edge_count = ddg.semantic_edges.size() + ddg.ordering_edges.size();
+  for (const SemanticDependencyEdge &edge : ddg.semantic_edges) {
     out << "    {\"source\": " << edge.source_instruction_id
         << ", \"target\": " << edge.target_instruction_id << ", \"buffer\": \""
         << edge.buffer->name << "\", \"distance\": " << edge.distance
         << ", \"kind\": \"" << SemanticDependencyKindName(edge.kind) << "\"}"
-        << (i + 1 == ddg.semantic_edges.size() ? "\n" : ",\n");
+        << (++edge_index == edge_count ? "\n" : ",\n");
+  }
+  for (const TemplateOrderEdge &edge : ddg.ordering_edges) {
+    out << "    {\"source\": " << edge.source_instruction_id
+        << ", \"target\": " << edge.target_instruction_id
+        << ", \"buffer\": null, \"distance\": " << edge.distance
+        << ", \"kind\": \"collective_order\"}"
+        << (++edge_index == edge_count ? "\n" : ",\n");
   }
   out << "  ],\n  \"buffers\": [\n";
   for (size_t i = 0; i < ddg.buffer_order.size(); ++i) {
@@ -1091,7 +1229,7 @@ private:
 
 class PipelineDevice {
 public:
-  explicit PipelineDevice(DeviceType type) : type(type) {}
+  explicit PipelineDevice(int resource) : resource(resource) {}
 
   void AssignInstruction(PipelineInstruction *instruction, float time) {
     current_instruction = instruction;
@@ -1110,7 +1248,7 @@ public:
     }
   }
 
-  DeviceType type{DeviceType::Unspecified};
+  int resource{-1};
   bool busy{false};
   PipelineInstruction *current_instruction{nullptr};
   float instruction_end_time{std::numeric_limits<float>::max()};
@@ -1123,9 +1261,14 @@ public:
   bool debug_{false};
 
   GlobalPipelineScheduler() {
-    devices_.push_back(PipelineDevice(DeviceType::ODMA));
-    devices_.push_back(PipelineDevice(DeviceType::TensorCore));
-    devices_.push_back(PipelineDevice(DeviceType::VectorCore));
+    devices_.push_back(
+        PipelineDevice(static_cast<int>(IlpResourceType::kTensorCore)));
+    devices_.push_back(
+        PipelineDevice(static_cast<int>(IlpResourceType::kVectorCore)));
+    devices_.push_back(
+        PipelineDevice(static_cast<int>(IlpResourceType::kODMA0)));
+    devices_.push_back(
+        PipelineDevice(static_cast<int>(IlpResourceType::kODMA1)));
   }
 
   void SetVersionedBuffers(
@@ -1136,6 +1279,10 @@ public:
   void SetBankColoring(const GreedyBankColoring &coloring) {
     writer_phases_ = coloring.writer_phases;
     reader_phases_ = coloring.reader_phases;
+  }
+
+  void SetTemplateOrderEdges(const std::vector<TemplateOrderEdge> &edges) {
+    template_order_edges_ = edges;
   }
 
   void BuildDependencyGraph() {
@@ -1231,6 +1378,26 @@ public:
                                  write_region->buffer.get(), true)});
       }
     }
+
+    std::map<std::pair<int, int>, int> instance_index;
+    for (int index = 0; index < instruction_count; ++index) {
+      instance_index[{instructions[index].iter, instructions[index].id}] =
+          index;
+    }
+    for (const TemplateOrderEdge &edge : template_order_edges_) {
+      for (int source_index = 0; source_index < instruction_count;
+           ++source_index) {
+        const PipelineInstruction &source = instructions[source_index];
+        if (source.id != edge.source_instruction_id) {
+          continue;
+        }
+        auto target = instance_index.find(
+            {source.iter + edge.distance, edge.target_instruction_id});
+        if (target != instance_index.end()) {
+          AddDependency(source_index, target->second);
+        }
+      }
+    }
   }
 
   void CalculateBottomLevels() {
@@ -1266,7 +1433,7 @@ public:
       }
       log_file << instruction_index << " " << instruction.name << " "
                << instruction.iter << " " << instruction.id << " "
-               << static_cast<int>(instruction.device_type) << " "
+               << instruction.execution_resource << " "
                << static_cast<int>(instruction.is_prefetch) << " "
                << bottom_level << "\n";
     }
@@ -1323,7 +1490,8 @@ public:
           continue;
         }
         for (auto &device : devices_) {
-          if (device.type == instruction->device_type && !device.busy) {
+          if (device.resource == instruction->execution_resource &&
+              !device.busy) {
             device.AssignInstruction(instruction, time);
             ReserveBanks(*instruction, instruction->scheduled_end);
             schedule.push_back(*instruction);
@@ -1352,11 +1520,11 @@ public:
       float start;
       float end;
     };
-    std::unordered_map<DeviceType, std::vector<Interval>> busy_intervals;
+    std::unordered_map<int, std::vector<Interval>> busy_intervals;
     std::array<std::vector<Interval>, static_cast<int>(PhysicalSramBank::Count)>
         bank_busy_intervals;
     for (const auto &instruction : schedule) {
-      busy_intervals[instruction.device_type].push_back(
+      busy_intervals[instruction.execution_resource].push_back(
           {instruction.scheduled_start, instruction.scheduled_end});
       for (PhysicalSramBank bank :
            GetOccupiedSramBanks(instruction, versioned_buffers_, iter_mod_,
@@ -1433,7 +1601,7 @@ public:
       }
 
       float duration = instruction->delay;
-      auto &intervals = busy_intervals[instruction->device_type];
+      auto &intervals = busy_intervals[instruction->execution_resource];
       float start_time = ready_time;
       std::vector<std::vector<Interval> *> required_intervals{&intervals};
       for (PhysicalSramBank bank :
@@ -1494,12 +1662,17 @@ public:
           if (lhs.scheduled_start != rhs.scheduled_start) {
             return lhs.scheduled_start < rhs.scheduled_start;
           }
+          int lhs_priority = GetGreedyIssuePriority(lhs);
+          int rhs_priority = GetGreedyIssuePriority(rhs);
+          if (lhs_priority != rhs_priority) {
+            return lhs_priority < rhs_priority;
+          }
           return lhs.name < rhs.name;
         });
     if (debug_ && log_file.is_open()) {
       for (const auto &instruction : schedule) {
         log_file << (instruction.is_prefetch ? "p:" : "") << instruction.name
-                 << " " << static_cast<int>(instruction.device_type) << " "
+                 << " " << instruction.execution_resource << " "
                  << instruction.scheduled_start << " " << instruction.delay
                  << "\n";
       }
@@ -1598,6 +1771,7 @@ private:
   std::unordered_set<const BufferNode *> versioned_buffers_;
   PerCommandBankPhases writer_phases_;
   PerCommandBankPhases reader_phases_;
+  std::vector<TemplateOrderEdge> template_order_edges_;
   std::vector<std::vector<int>> predecessors_;
   std::vector<std::vector<int>> successors_;
   std::vector<int> topological_order_;
@@ -1661,12 +1835,6 @@ public:
     const SeqStmtNode *pipeline_body_seq = inner_stmt.as<SeqStmtNode>();
     ICHECK(pipeline_body_seq) << "Pipeline body must be a SeqStmt";
     ICHECK(op->kind == ForKind::kSerial) << "Pipeline loop must be serial";
-    if (HasRepeatedCollectiveDestination(pipeline_body_seq)) {
-      For fallback = Downcast<For>(StmtExprMutator::VisitStmt_(op));
-      return MakePipelineFallback(fallback, "greedy", "planning",
-                                  "repeated_collective_destination");
-    }
-
     // 3. Stage 1: Build the PipelineInstruction containers
     std::vector<PipelineInstruction> single_iteration_instructions;
 
@@ -1684,6 +1852,7 @@ public:
       PipelineInstruction instruction(static_cast<int>(i), 0, stmt);
       instruction.device_type = HardwareMapper::Map(instruction.stmt);
       instruction.ExtractRegions(stmt_rw_collector_);
+      instruction.execution_resource = GetGreedyExecutionResource(instruction);
       instruction.delay =
           CostModel::EstimateDelay(instruction.device_type, instruction.stmt);
       single_iteration_instructions.push_back(instruction);
@@ -1697,6 +1866,7 @@ public:
       for (const auto &instruction : single_iteration_instructions) {
         std::cout << "  - ID: " << instruction.id
                   << ", Device: " << static_cast<int>(instruction.device_type)
+                  << ", Resource: " << instruction.execution_resource
                   << ", Delay: " << instruction.delay
                   << ", Reads: " << instruction.reads.size()
                   << ", Writes: " << instruction.writes.size() << "\n";
@@ -1821,6 +1991,7 @@ public:
       candidate_scheduler.iter_mod_ = stage_assembly.iterations;
       candidate_scheduler.SetVersionedBuffers(versioned_buffers);
       candidate_scheduler.SetBankColoring(candidate);
+      candidate_scheduler.SetTemplateOrderEdges(local_ddg.ordering_edges);
       candidate_scheduler.BuildDependencyGraph();
       candidate_scheduler.CalculateBottomLevels();
       std::vector<PipelineInstruction> candidate_schedule =
@@ -1843,6 +2014,7 @@ public:
     prologue_scheduler.debug_ = debug_;
     prologue_scheduler.SetVersionedBuffers(versioned_buffers);
     prologue_scheduler.SetBankColoring(selected_coloring);
+    prologue_scheduler.SetTemplateOrderEdges(local_ddg.ordering_edges);
     prologue_scheduler.BuildDependencyGraph();
     prologue_scheduler.CalculateBottomLevels();
     std::vector<PipelineInstruction> prologue_schedule =
@@ -1854,6 +2026,7 @@ public:
     body_scheduler.debug_ = debug_;
     body_scheduler.SetVersionedBuffers(versioned_buffers);
     body_scheduler.SetBankColoring(selected_coloring);
+    body_scheduler.SetTemplateOrderEdges(local_ddg.ordering_edges);
     body_scheduler.BuildDependencyGraph();
     body_scheduler.CalculateBottomLevels();
     body_scheduler.DumpGraph("body_graph.log");
@@ -1869,6 +2042,7 @@ public:
       epilogue_scheduler.debug_ = debug_;
       epilogue_scheduler.SetVersionedBuffers(versioned_buffers);
       epilogue_scheduler.SetBankColoring(selected_coloring);
+      epilogue_scheduler.SetTemplateOrderEdges(local_ddg.ordering_edges);
       epilogue_scheduler.BuildDependencyGraph();
       epilogue_scheduler.CalculateBottomLevels();
       epilogue_schedule = epilogue_scheduler.Schedule("epilogue.log");
@@ -1887,6 +2061,7 @@ public:
         epilogue_scheduler.iter_mod_ = stage_assembly.iterations;
         epilogue_scheduler.SetVersionedBuffers(versioned_buffers);
         epilogue_scheduler.SetBankColoring(selected_coloring);
+        epilogue_scheduler.SetTemplateOrderEdges(local_ddg.ordering_edges);
         epilogue_scheduler.BuildDependencyGraph();
         epilogue_scheduler.CalculateBottomLevels();
         dynamic_epilogue_schedules[remainder] = epilogue_scheduler.Schedule("");

@@ -63,8 +63,9 @@ public:
     substituter.replace_flag = true;
 
     for (auto &buffer : substituter.versioned_buffers_) {
+      int versions = substituter.version_counts_.at(buffer.get());
       if (substituter.IsBankedBuffer(buffer)) {
-        int ping_versions = (substituter.iterations_ + 1) / 2;
+        int ping_versions = (versions + 1) / 2;
         int pong_versions = ping_versions;
         Buffer ping = substituter.makeMultiVersionBuffer(buffer, ping_versions,
                                                          "_ping", true);
@@ -73,9 +74,8 @@ public:
         substituter.buffer_remap_.Set(buffer, ping);
         substituter.bank_peer_buffers_[buffer.get()] = pong;
       } else {
-        substituter.buffer_remap_.Set(buffer,
-                                      substituter.makeMultiVersionBuffer(
-                                          buffer, substituter.iterations_));
+        substituter.buffer_remap_.Set(
+            buffer, substituter.makeMultiVersionBuffer(buffer, versions));
       }
     }
 
@@ -205,8 +205,15 @@ private:
           Downcast<Array<Buffer>>(versioned_buffers_anno.value());
       int iterations = Downcast<int>(iterations_anno.value());
       if (!replace_flag) {
-        versioned_buffers_ = versioned_buffers;
-        iterations_ = iterations;
+        for (const Buffer &buffer : versioned_buffers) {
+          auto [it, inserted] =
+              version_counts_.try_emplace(buffer.get(), iterations);
+          if (inserted) {
+            versioned_buffers_.push_back(buffer);
+          } else {
+            it->second = std::max(it->second, iterations);
+          }
+        }
       } else {
         Array<Buffer> new_versioned_buffers;
         for (const Buffer &buffer : versioned_buffers) {
@@ -232,11 +239,16 @@ private:
                                               bank_peer_buffers);
         }
         Array<Buffer> version_axis_buffers;
-        for (const auto &kv : buffer_remap_) {
-          if (HasVersionAxis(kv.second)) {
-            version_axis_buffers.push_back(kv.second);
+        for (const Buffer &buffer : versioned_buffers) {
+          auto remap_it = buffer_remap_.find(buffer);
+          if (remap_it == buffer_remap_.end()) {
+            continue;
           }
-          auto peer_it = bank_peer_buffers_.find(kv.first.get());
+          const Buffer &remapped = (*remap_it).second;
+          if (HasVersionAxis(remapped)) {
+            version_axis_buffers.push_back(remapped);
+          }
+          auto peer_it = bank_peer_buffers_.find(buffer.get());
           if (peer_it != bank_peer_buffers_.end() &&
               HasVersionAxis(peer_it->second)) {
             version_axis_buffers.push_back(peer_it->second);
@@ -454,7 +466,7 @@ private:
     return it != buffer_has_version_axis_.end() && it->second;
   }
 
-  int iterations_ = -1;
+  std::unordered_map<const BufferNode *, int> version_counts_;
   bool replace_flag = false;
   Map<Buffer, Buffer> buffer_remap_;
   Map<Var, Var> var_remap_;
