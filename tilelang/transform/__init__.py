@@ -751,6 +751,17 @@ def InjectSunmmioPipelineILP():
     return _ffi_api.InjectSunmmioPipelineILP()  # type: ignore
 
 
+def RemoveUnusedSunmmioAllocations():
+    """Remove allocations unused by executable SunMMIO TIR.
+
+    Returns
+    -------
+    fpass : tvm.transform.Pass
+        The result pass
+    """
+    return _ffi_api.RemoveUnusedSunmmioAllocations()  # type: ignore
+
+
 def MergeSharedMemoryAllocationsSunmmio(
     enable_aggressive_merge: bool = False,
     asram_align_bytes: int = 2048,
